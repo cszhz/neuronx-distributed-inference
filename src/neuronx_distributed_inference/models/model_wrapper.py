@@ -27,6 +27,9 @@ from neuronx_distributed_inference.modules.async_execution import (
     get_async_output,
     is_ranked_io,
 )
+from neuronx_distributed.utils.tensor_capture import (
+    enable_tensor_capture,
+)
 from neuronx_distributed_inference.modules.generation.sampling import prepare_sampling_params
 
 CONTEXT_ENCODING_MODEL_TAG = "context_encoding_model"
@@ -267,6 +270,13 @@ class ModelWrapper(torch.nn.Module):
                 else torch.zeros((batch_size), dtype=torch.int32)
             )
 
+            # Create inputs_embeds placeholder for multimodal models
+            # Use randn instead of zeros to ensure meaningful gradients during tracing
+            inputs_embeds = torch.randn(
+                (batch_size, n_active_tokens, self.config.hidden_size),
+                dtype=self.config.neuron_config.torch_dtype,
+            ) * 0.1  # Scale to typical embedding magnitude
+
             if self.is_medusa:
                 assert (
                     self.neuron_config.on_device_sampling_config
@@ -304,6 +314,7 @@ class ModelWrapper(torch.nn.Module):
                         sampling_params,
                         hidden_states,
                         adapter_ids,
+                        inputs_embeds,
                         accepted_indices,
                         current_length,
                         medusa_mask,
@@ -336,7 +347,7 @@ class ModelWrapper(torch.nn.Module):
             elif self.neuron_config.tensor_replacement_config:
                 reg = TensorReplacementRegister.get_instance()
                 tf_tensors, tf_masks = reg.example_args(step=1) if self.tag == CONTEXT_ENCODING_MODEL_TAG else reg.example_args(step=2)
-                empties = [torch.empty(0) for i in range(17)]
+                empties = [torch.empty(0) for i in range(16)]  # Reduced to 16 since inputs_embeds is now explicit
                 inputs.append(
                     (
                         input_ids,
@@ -346,6 +357,7 @@ class ModelWrapper(torch.nn.Module):
                         sampling_params,
                         hidden_states,
                         adapter_ids,
+                        inputs_embeds,
                         *empties,
                         *tf_tensors,
                         *tf_masks
@@ -361,6 +373,7 @@ class ModelWrapper(torch.nn.Module):
                         sampling_params,
                         hidden_states,
                         adapter_ids,
+                        inputs_embeds,
                     )
                 )
 
@@ -449,6 +462,7 @@ class ModelWrapper(torch.nn.Module):
             sampling_params,
             torch.empty(0),  # prev_hidden
             torch.empty(0),  # adapter_ids
+            torch.empty(0),  # inputs_embeds
             torch.empty(0),  # accepted_indices
             torch.empty(0),  # current_length
             torch.empty(0),  # medusa_mask
@@ -496,6 +510,7 @@ class ModelWrapper(torch.nn.Module):
                     sampling_params,
                     torch.empty(0),  # prev_hidden
                     torch.empty(0),  # adapter_ids
+                    torch.empty(0),  # inputs_embeds
                     slot_mapping,
                     active_block_table,
                     num_queries,
@@ -529,6 +544,7 @@ class ModelWrapper(torch.nn.Module):
                     sampling_params,
                     torch.empty(0),  # prev_hidden
                     torch.empty(0),  # adapter_ids
+                    torch.empty(0),  # inputs_embeds
                     slot_mapping,
                     active_block_table,
                     num_queries,
@@ -548,6 +564,7 @@ class ModelWrapper(torch.nn.Module):
                 sampling_params,
                 torch.empty(0),  # prev_hidden
                 torch.empty(0),  # adapter_ids
+                torch.empty(0),  # inputs_embeds
                 slot_mapping,
                 active_block_table,
                 num_queries,
@@ -562,6 +579,7 @@ class ModelWrapper(torch.nn.Module):
                 sampling_params,
                 torch.empty(0),  # prev_hidden
                 torch.empty(0),  # adapter_ids
+                torch.empty(0),  # inputs_embeds
                 torch.empty(0),  # accepted_indices
                 torch.empty(0),  # current_length
                 torch.empty(0),  # medusa_mask
@@ -771,7 +789,7 @@ class ModelWrapper(torch.nn.Module):
         Neuron compiler handles int32 better than int64. Context: P165494809
         """
         return [
-            t.to(torch.int32) if not isinstance(t, list) and t.dtype == torch.int64 else t
+            t.to(torch.int32) if t is not None and not isinstance(t, list) and hasattr(t, 'dtype') and t.dtype == torch.int64 else t
             for t in args
         ]
 
@@ -810,24 +828,63 @@ class ModelWrapper(torch.nn.Module):
             pad_length = self.get_target_bucket(*args, strategy=pad_type)
 
         if (self.tag == CONTEXT_ENCODING_MODEL_TAG or self.tag == VISION_ENCODER_MODEL_TAG):
-            to_pad = args[:3]
-            pad_lengths = [pad_length - arg.shape[1] for arg in to_pad]
-            tensor_pad_vals = [self.config.pad_token_id, 0, 1]
-            if any([pad_len < 0 for pad_len in pad_lengths]):
-                if self.neuron_config.allow_input_truncation:
-                    warnings.warn(
-                        f"Truncating input ({to_pad[1].shape[1]} tokens) to max_context_length ({self.neuron_config.max_context_length} tokens). This may cause unexpected outputs."
-                    )
+            # Check if input_ids is None (inputs_embeds-only mode)
+            if args[0] is None:
+                # input_ids is None, get seq_len from inputs_embeds or attention_mask
+                if len(args) >= 8 and args[7] is not None and hasattr(args[7], 'shape'):
+                    seq_len = args[7].shape[1]  # inputs_embeds shape: [batch, seq_len, hidden]
                 else:
-                    raise ValueError(
-                        f"Inputs supplied ({to_pad[1].shape[1]} tokens) are longer than max_context_length ({self.neuron_config.max_context_length} tokens). To truncate inputs, set allow_input_truncation=True."
-                    )
+                    seq_len = args[1].shape[1]  # attention_mask shape: [batch, seq_len]
 
-            padded_args = [
-                F.pad(arg, (0, pad_len), "constant", pad_val)
-                for arg, pad_val, pad_len in zip(to_pad, tensor_pad_vals, pad_lengths)
-            ]
-            args = (*padded_args, *args[3:])
+                pad_lengths = [pad_length - seq_len, pad_length - seq_len]
+
+                if any([pad_len < 0 for pad_len in pad_lengths]):
+                    if self.neuron_config.allow_input_truncation:
+                        warnings.warn(
+                            f"Truncating input ({seq_len} tokens) to max_context_length ({self.neuron_config.max_context_length} tokens). This may cause unexpected outputs."
+                        )
+                    else:
+                        raise ValueError(
+                            f"Inputs supplied ({seq_len} tokens) are longer than max_context_length ({self.neuron_config.max_context_length} tokens). To truncate inputs, set allow_input_truncation=True."
+                        )
+
+                # Pad attention_mask and position_ids
+                padded_attention_mask = F.pad(args[1], (0, pad_lengths[0]), "constant", 0)
+                padded_position_ids = F.pad(args[2], (0, pad_lengths[1]), "constant", 1)
+
+                # Pad inputs_embeds if present (argument 8, index 7)
+                if len(args) >= 8 and args[7] is not None and hasattr(args[7], 'shape') and len(args[7].shape) == 3:
+                    inputs_embeds_padded = F.pad(args[7], (0, 0, 0, pad_lengths[0]), "constant", 0)
+                    # Rebuild args: None, padded_attention_mask, padded_position_ids, seq_ids, sampling_params, hidden_states, adapter_ids, inputs_embeds_padded, ...
+                    args = (None, padded_attention_mask, padded_position_ids, *args[3:7], inputs_embeds_padded, *args[8:])
+                else:
+                    # No inputs_embeds, just rebuild with None input_ids
+                    args = (None, padded_attention_mask, padded_position_ids, *args[3:])
+            else:
+                # Normal path: input_ids is provided
+                to_pad = args[:3]
+                pad_lengths = [pad_length - arg.shape[1] for arg in to_pad]
+                tensor_pad_vals = [self.config.pad_token_id, 0, 1]
+                if any([pad_len < 0 for pad_len in pad_lengths]):
+                    if self.neuron_config.allow_input_truncation:
+                        warnings.warn(
+                            f"Truncating input ({to_pad[1].shape[1]} tokens) to max_context_length ({self.neuron_config.max_context_length} tokens). This may cause unexpected outputs."
+                        )
+                    else:
+                        raise ValueError(
+                            f"Inputs supplied ({to_pad[1].shape[1]} tokens) are longer than max_context_length ({self.neuron_config.max_context_length} tokens). To truncate inputs, set allow_input_truncation=True."
+                        )
+
+                padded_args = [
+                    F.pad(arg, (0, pad_len), "constant", pad_val)
+                    for arg, pad_val, pad_len in zip(to_pad, tensor_pad_vals, pad_lengths)
+                ]
+                # Also pad inputs_embeds if present (argument 8, index 7)
+                if len(args) >= 8 and args[7] is not None and hasattr(args[7], 'shape') and len(args[7].shape) == 3:
+                    inputs_embeds_padded = F.pad(args[7], (0, 0, 0, pad_lengths[0]), "constant", 0)
+                    args = (*padded_args, *args[3:7], inputs_embeds_padded, *args[8:])
+                else:
+                    args = (*padded_args, *args[3:])
             if len(args) == 24 and len(args[23].shape) == 3 and args[23].shape[1] != pad_length:
                 # Re-generate dummy vision embeddings and mask
                 padded_seq_len = args[0].shape[1]
@@ -1480,7 +1537,9 @@ class ModelWrapper(torch.nn.Module):
         else:
             # Handle async ranked case, only input_ids[0] is ranked
             input_ids = args[0]
-            args = tuple([arg for arg in args if isinstance(arg, torch.Tensor)])
+            # Don't filter out None values - we need to preserve input_ids=None for inputs_embeds-only mode
+            # Original line: args = tuple([arg for arg in args if isinstance(arg, torch.Tensor)])
+            # Keep all args including None
             if is_ranked_io(input_ids):
                 args = list([input_ids] + list(args))
 
@@ -1670,6 +1729,15 @@ class DecoderModelInstance(BaseModelInstance):
             reg = TensorReplacementRegister.get_instance()
             reg.hooks = hooks.values()
 
+        # Enable tensor capture if configured
+        if self.neuron_config.tensor_capture_config:
+            self.module = enable_tensor_capture(
+                self.module,
+                modules_to_capture=self.neuron_config.tensor_capture_config.modules_to_capture,
+                max_tensors=self.neuron_config.tensor_capture_config.max_intermediate_tensors,
+                capture_inputs=self.neuron_config.tensor_capture_config.capture_inputs
+            )
+
     def get(self, bucket_rank, **kwargs):
         if bucket_rank is not None:
             if self.neuron_config.is_prefix_caching:
@@ -1700,6 +1768,11 @@ class DecoderModelInstance(BaseModelInstance):
         # generating HLO
         self.input_output_aliases = {}
         num_output_from_trace = 1 if not self.neuron_config.output_logits else 2
+
+        # Add tensor capture to output count if enabled
+        if self.neuron_config.tensor_capture_config:
+            num_output_from_trace += self.neuron_config.tensor_capture_config.get_offset()
+
         if self.neuron_config.enable_fused_speculation:
             num_output_from_trace += 1
             if self.module.draft_model.kv_mgr is not None:
@@ -1723,7 +1796,6 @@ class DecoderModelInstance(BaseModelInstance):
                 self.input_output_aliases[self.module.hidden_state_rolling_buffer.hidden_states] = (
                     num_output_from_trace * 2 + len(draft_past_key_values)
                 ) + len(target_past_key_values)
-
         else:
             # TODO: This else block is a short-term fix for Llava/ViT models to use DecoderModelInstance.
             #       Long-term, these models should use a different implementation of BaseModelInstance.
